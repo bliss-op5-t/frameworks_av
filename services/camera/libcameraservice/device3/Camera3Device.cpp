@@ -2465,6 +2465,25 @@ status_t Camera3Device::configureStreamsLocked(int operatingMode,
         return BAD_VALUE;
     }
 
+#ifdef CAMERA_PACKAGE_NAME
+    sp<VendorTagDescriptor> vTags;
+    sp<VendorTagDescriptorCache> vCache = VendorTagDescriptorCache::getGlobalVendorTagCache();
+    if (vCache.get()) {
+        const camera_metadata_t *metaBuffer = sessionParams.getAndLock();
+        metadata_vendor_id_t vendorId = get_camera_metadata_vendor_id(metaBuffer);
+        sessionParams.unlock(metaBuffer);
+        vCache->getVendorTagDescriptor(vendorId, &vTags);
+        uint32_t tag;
+        if (CameraMetadata::getTagFromName(CAMERA_PACKAGE_NAME, vTags.get(), &tag)) {
+            ALOGE("%s: Unable to get %s tag", __FUNCTION__, CAMERA_PACKAGE_NAME);
+        } else {
+            std::string pkgName = CameraService::getCurrPackageName();
+            status_t res = const_cast<CameraMetadata&>(sessionParams).update(tag, String8(pkgName.c_str()));
+            if (res) {
+                ALOGE("%s: metadata update failed, res = %d", __FUNCTION__, res);
+            }
+        }
+
 #ifdef INCLUDES_MIUI_CAMERA
     {
         sp<VendorTagDescriptor> vTags =
@@ -3746,9 +3765,21 @@ bool Camera3Device::RequestThread::threadLoop() {
         cleanUpFailedRequests(/*sendRequestError*/ true);
         // Check if any stream is abandoned.
         checkAndStopRepeatingRequest();
+        // Inform waitUntilRequestProcessed thread of a new request ID
+        {
+            Mutex::Autolock al(mLatestRequestMutex);
+            mLatestRequestId = latestRequestId;
+            mLatestRequestSignal.signal();
+        }
         return true;
     } else if (res != OK) {
         cleanUpFailedRequests(/*sendRequestError*/ false);
+        // Inform waitUntilRequestProcessed thread of a new request ID
+        {
+            Mutex::Autolock al(mLatestRequestMutex);
+            mLatestRequestId = latestRequestId;
+            mLatestRequestSignal.signal();
+        }
         return false;
     }
 

@@ -123,7 +123,8 @@ void AudioPolicyManager::broadcastDeviceConnectionState(const sp<DeviceDescripto
     device->toAudioPort(&devicePort);
     if (status_t status = mpClientInterface->setDeviceConnectedState(&devicePort, state);
             status != OK) {
-        ALOGE("Error %d while setting connected state for device %s", state,
+        ALOGE("Error %d while setting connected state %d for device %s",
+                status, static_cast<int>(state),
                 device->getDeviceTypeAddr().toString(false).c_str());
     }
 }
@@ -211,9 +212,9 @@ status_t AudioPolicyManager::setDeviceConnectionStateInt(const sp<DeviceDescript
             if (checkOutputsForDevice(device, state, outputs) != NO_ERROR) {
                 mAvailableOutputDevices.remove(device);
 
-                mHwModules.cleanUpForDevice(device);
-
                 broadcastDeviceConnectionState(device, media::DeviceConnectedState::DISCONNECTED);
+
+                mHwModules.cleanUpForDevice(device);
                 return INVALID_OPERATION;
             }
 
@@ -2085,7 +2086,14 @@ audio_io_handle_t AudioPolicyManager::selectOutput(const SortedVector<audio_io_h
 
         // sampling rate match
         if (samplingRate > SAMPLE_RATE_HZ_DEFAULT) {
-            currentMatchCriteria[4] = outputDesc->getSamplingRate();
+            int diff;  // avoid unsigned integer overflow.
+            __builtin_sub_overflow(outputDesc->getSamplingRate(), samplingRate, &diff);
+
+            // prefer the closest output sampling rate greater than or equal to target
+            // if none exists, prefer the closest output sampling rate less than target.
+            //
+            // criteria is offset to make non-negative.
+            currentMatchCriteria[4] = diff >= 0 ? -diff + 200'000'000 : diff + 100'000'000;
         }
 
         // performance flags match
@@ -3280,7 +3288,11 @@ status_t AudioPolicyManager::setVolumeIndexForAttributes(const audio_attributes_
     auto curCurvAttrs = curves.getAttributes();
     if (!curCurvAttrs.empty() && curCurvAttrs.front() != defaultAttr) {
         auto attr = curCurvAttrs.front();
-        curSrcDevices = mEngine->getOutputDevicesForAttributes(attr, nullptr, false).types();
+        // called is expected to request getDevicesForAttributes in prior of setVolumes
+        // Shall not use engine device to prevent bypassing mixes (expect loopback)
+        DeviceVector devices;
+        getDevicesForAttributes(attr, devices, /* forVolume */ true);
+        curSrcDevices = devices.types();
     } else if (!curves.getStreamTypes().empty()) {
         auto stream = curves.getStreamTypes().front();
         curSrcDevices = mEngine->getOutputDevicesForStream(stream, false).types();
@@ -3299,6 +3311,7 @@ status_t AudioPolicyManager::setVolumeIndexForAttributes(const audio_attributes_
     // requested device or one of the devices selected by the engine for this stream
     // - For default requested device (AUDIO_DEVICE_OUT_DEFAULT_FOR_VOLUME), apply volume only if
     // no specific device volume value exists for currently selected device.
+    // - Only apply the volume if the requested device is the desired device for volume control.
     for (size_t i = 0; i < mOutputs.size(); i++) {
         sp<SwAudioOutputDescriptor> desc = mOutputs.valueAt(i);
         DeviceTypeSet curDevices = desc->devices().types();
@@ -3318,7 +3331,8 @@ status_t AudioPolicyManager::setVolumeIndexForAttributes(const audio_attributes_
         if (device != AUDIO_DEVICE_OUT_DEFAULT_FOR_VOLUME) {
             curSrcDevices.insert(device);
             applyVolume = (curSrcDevices.find(
-                    Volume::getDeviceForVolume(curDevices)) != curSrcDevices.end());
+                    Volume::getDeviceForVolume(curDevices)) != curSrcDevices.end())
+                    && Volume::getDeviceForVolume(curSrcDevices) == device;
         } else {
             applyVolume = !curves.hasVolumeIndexForDevice(curSrcDevice);
         }
@@ -3503,9 +3517,17 @@ audio_io_handle_t AudioPolicyManager::selectOutputForMusicEffects()
     }
 
     if (output != mMusicEffectOutput) {
-        mEffects.moveEffects(AUDIO_SESSION_OUTPUT_MIX, mMusicEffectOutput, output,
-                mpClientInterface);
-        mMusicEffectOutput = output;
+        if (mpClientInterface->moveEffects(
+                                      AUDIO_SESSION_OUTPUT_MIX,
+                                      mMusicEffectOutput, output) != NO_ERROR
+            && mOutputs.valueFor(output)->isDuplicated()) {
+            ALOGW("gloabl effect do not support duplicating thread");
+            output = AUDIO_IO_HANDLE_NONE;
+        } else {
+            mEffects.moveEffects(AUDIO_SESSION_OUTPUT_MIX, mMusicEffectOutput, output,
+                    mpClientInterface);
+            mMusicEffectOutput = output;
+        }
     }
 
     ALOGV("selectOutputForMusicEffects selected output %d", output);
@@ -7170,7 +7192,6 @@ DeviceVector AudioPolicyManager::getNewOutputDevices(const sp<SwAudioOutputDescr
     DeviceVector devices;
     for (const auto &productStrategy : mEngine->getOrderedProductStrategies()) {
         StreamTypeVector streams = mEngine->getStreamTypesForProductStrategy(productStrategy);
-        auto attr = mEngine->getAllAttributesForProductStrategy(productStrategy).front();
         auto hasStreamActive = [&](auto stream) {
             return hasStream(streams, stream) && isStreamActive(stream, 0);
         };
@@ -7195,6 +7216,7 @@ DeviceVector AudioPolicyManager::getNewOutputDevices(const sp<SwAudioOutputDescr
                 mOutputs.isStrategyActiveOnSameModule(productStrategy, outputDesc))) {
             // Retrieval of devices for voice DL is done on primary output profile, cannot
             // check the route (would force modifying configuration file for this profile)
+            auto attr = mEngine->getAllAttributesForProductStrategy(productStrategy).front();
             devices = mEngine->getOutputDevicesForAttributes(attr, nullptr, fromCache);
             break;
         }

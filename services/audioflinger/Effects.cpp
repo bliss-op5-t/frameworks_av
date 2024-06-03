@@ -1039,18 +1039,19 @@ void EffectModule::addEffectToHal_l()
 {
     if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
          (mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC) {
-        if (mCurrentHalStream == getCallback()->io()) {
+        if (!getCallback()->dispatchAddRemoveToHal(/* isAdded= */ true)) {
             return;
         }
 
         (void)getCallback()->addEffectToHal(mEffectInterface);
-        mCurrentHalStream = getCallback()->io();
     }
 }
 
 // start() must be called with PlaybackThread::mutex() or EffectChain::mutex() held
 status_t EffectModule::start()
 {
+    // set volume before enabling an effect
+    getCallback()->resetVolume();
     status_t status;
     {
         audio_utils::lock_guard _l(mutex());
@@ -1140,11 +1141,10 @@ status_t EffectModule::removeEffectFromHal_l()
 {
     if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC ||
              (mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC) {
-        if (mCurrentHalStream != getCallback()->io()) {
-            return (mCurrentHalStream == AUDIO_IO_HANDLE_NONE) ? NO_ERROR : INVALID_OPERATION;
+        if (!getCallback()->dispatchAddRemoveToHal(/* isAdded= */ false)) {
+            return (getCallback()->io() == AUDIO_IO_HANDLE_NONE) ? NO_ERROR : INVALID_OPERATION;
         }
         getCallback()->removeEffectFromHal(mEffectInterface);
-        mCurrentHalStream = AUDIO_IO_HANDLE_NONE;
     }
     return NO_ERROR;
 }
@@ -2198,10 +2198,11 @@ void EffectChain::clearInputBuffer_l()
     if (mInBuffer == NULL) {
         return;
     }
-    const size_t frameSize = audio_bytes_per_sample(AUDIO_FORMAT_PCM_FLOAT)
-            * mEffectCallback->inChannelCount(mEffects[0]->id());
 
-    memset(mInBuffer->audioBuffer()->raw, 0, mEffectCallback->frameCount() * frameSize);
+    // We clear entire buffer instead of actual data size to avoid reading stale data
+    // on spatializer effect chain when the last spatialized track is removed.
+    // memset(mInBuffer->audioBuffer()->raw, 0, mEffectCallback->frameCount() * frameSize);
+    memset(mInBuffer->audioBuffer()->raw, 0, mInBuffer->getSize());
     mInBuffer->commit();
 }
 
@@ -2805,6 +2806,11 @@ static const effect_uuid_t SL_IID_VOLUME_ = { 0x09e8ede0, 0xddde, 0x11db, 0xb4f6
 const effect_uuid_t * const SL_IID_VOLUME = &SL_IID_VOLUME_;
 #endif //OPENSL_ES_H_
 
+// Dolby Atmos
+static const effect_uuid_t SL_IID_DAP_ = // 46d279d9-9be7-453d-9d7c-ef937f675587
+{ 0x46d279d9, 0x9be7, 0x453d, 0x9d7c, {0xef, 0x93, 0x7f, 0x67, 0x55, 0x87} };
+const effect_uuid_t * const SL_IID_DAP = &SL_IID_DAP_;
+
 /* static */
 bool EffectChain::isEffectEligibleForBtNrecSuspend(const effect_uuid_t *type)
 {
@@ -2823,7 +2829,8 @@ bool EffectChain::isEffectEligibleForSuspend(const effect_descriptor_t& desc)
         (((desc.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_AUXILIARY) ||
          (memcmp(&desc.type, SL_IID_VISUALIZATION, sizeof(effect_uuid_t)) == 0) ||
          (memcmp(&desc.type, SL_IID_VOLUME, sizeof(effect_uuid_t)) == 0) ||
-         (memcmp(&desc.type, SL_IID_DYNAMICSPROCESSING, sizeof(effect_uuid_t)) == 0))) {
+         (memcmp(&desc.type, SL_IID_DYNAMICSPROCESSING, sizeof(effect_uuid_t)) == 0) ||
+         (memcmp(&desc.type, SL_IID_DAP, sizeof(effect_uuid_t)) == 0))) {
         return false;
     }
     return true;
@@ -3019,12 +3026,16 @@ status_t EffectChain::EffectCallback::addEffectToHal(
         return result;
     }
     result = st->addEffect(effect);
+    if (result == OK) {
+        mCurrentHalStream = t->id();
+    }
     ALOGE_IF(result != OK, "Error when adding effect: %d", result);
     return result;
 }
 
 status_t EffectChain::EffectCallback::removeEffectFromHal(
         const sp<EffectHalInterface>& effect) {
+    mCurrentHalStream = AUDIO_IO_HANDLE_NONE;
     status_t result = NO_INIT;
     const sp<IAfThreadBase> t = thread().promote();
     if (t == nullptr) {
@@ -3037,6 +3048,11 @@ status_t EffectChain::EffectCallback::removeEffectFromHal(
     result = st->removeEffect(effect);
     ALOGE_IF(result != OK, "Error when removing effect: %d", result);
     return result;
+}
+
+bool EffectChain::EffectCallback::dispatchAddRemoveToHal(bool isAdded) const {
+    const bool currentHalStreamMatchesThreadId = (io() == mCurrentHalStream);
+    return isAdded != currentHalStreamMatchesThreadId;
 }
 
 audio_io_handle_t EffectChain::EffectCallback::io() const {
@@ -3093,11 +3109,11 @@ NO_THREAD_SAFETY_ANALYSIS
 {
     const sp<IAfThreadBase> t = thread().promote();
     if (t == nullptr) {
-        return AUDIO_CHANNEL_NONE;
+        return AUDIO_CHANNEL_OUT_STEREO;
     }
     sp<IAfEffectChain> c = chain().promote();
     if (c == nullptr) {
-        return AUDIO_CHANNEL_NONE;
+        return AUDIO_CHANNEL_OUT_STEREO;
     }
 
     if (mThreadType == IAfThreadBase::SPATIALIZER) {
@@ -3132,11 +3148,11 @@ NO_THREAD_SAFETY_ANALYSIS
 {
     const sp<IAfThreadBase> t = thread().promote();
     if (t == nullptr) {
-        return AUDIO_CHANNEL_NONE;
+        return AUDIO_CHANNEL_OUT_STEREO;
     }
     sp<IAfEffectChain> c = chain().promote();
     if (c == nullptr) {
-        return AUDIO_CHANNEL_NONE;
+        return AUDIO_CHANNEL_OUT_STEREO;
     }
 
     if (mThreadType == IAfThreadBase::SPATIALIZER) {
@@ -3628,11 +3644,14 @@ status_t DeviceEffectProxy::ProxyCallback::addEffectToHal(
     if (proxy == nullptr) {
         return NO_INIT;
     }
-    return proxy->addEffectToHal(effect);
+    status_t ret = proxy->addEffectToHal(effect);
+    mAddedToHal = (ret == OK);
+    return ret;
 }
 
 status_t DeviceEffectProxy::ProxyCallback::removeEffectFromHal(
         const sp<EffectHalInterface>& effect) {
+    mAddedToHal = false;
     sp<DeviceEffectProxy> proxy = mProxy.promote();
     if (proxy == nullptr) {
         return NO_INIT;

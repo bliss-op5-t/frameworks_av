@@ -47,6 +47,7 @@
 #include <binder/IPCThreadState.h>
 #include <binder/IServiceManager.h>
 #include <binder/PersistableBundle.h>
+#include <set>
 #include <cutils/bitops.h>
 #include <cutils/properties.h>
 #include <fastpath/AutoPark.h>
@@ -185,7 +186,7 @@ static const nsecs_t kDirectMinSleepTimeUs = 10000;
 // Minimum amount of time between checking to see if the timestamp is advancing
 // for underrun detection. If we check too frequently, we may not detect a
 // timestamp update and will falsely detect underrun.
-static const nsecs_t kMinimumTimeBetweenTimestampChecksNs = 150 /* ms */ * 1000;
+static constexpr nsecs_t kMinimumTimeBetweenTimestampChecksNs = 150 /* ms */ * 1'000'000;
 
 // The universal constant for ubiquitous 20ms value. The value of 20ms seems to provide a good
 // balance between power consumption and latency, and allows threads to be scheduled reliably
@@ -2758,6 +2759,43 @@ ssize_t PlaybackThread::Tracks<T>::remove(const sp<T>& track)
         }
     }
     return index;
+}
+
+void PlaybackThread::listAppVolumes(std::set<media::AppVolume> &container)
+{
+    audio_utils::lock_guard _l(mutex());
+    for (sp<IAfTrack> track : mTracks) {
+        if (!track->getPackageName().empty()) {
+            media::AppVolume av;
+            av.packageName = track->getPackageName();
+            av.muted = track->isAppMuted();
+            av.volume = track->getAppVolume();
+            av.active = mActiveTracks.indexOf(track) >= 0;
+            container.insert(av);
+        }
+    }
+}
+
+status_t PlaybackThread::setAppVolume(const String8& packageName, const float value)
+{
+    audio_utils::lock_guard _l(mutex());
+    for (sp<IAfTrack> track : mTracks) {
+        if (packageName == track->getPackageName()) {
+            track->setAppVolume(value);
+        }
+    }
+    return NO_ERROR;
+}
+
+status_t PlaybackThread::setAppMute(const String8& packageName, const bool value)
+{
+    audio_utils::lock_guard _l(mutex());
+    for (sp<IAfTrack> track : mTracks) {
+        if (packageName == track->getPackageName()) {
+            track->setAppMute(value);
+        }
+    }
+    return NO_ERROR;
 }
 
 uint32_t PlaybackThread::correctLatency_l(uint32_t latency) const
@@ -5647,10 +5685,12 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
                 }
                 sp<AudioTrackServerProxy> proxy = track->audioTrackServerProxy();
                 float volume;
-                if (track->isPlaybackRestricted() || mStreamTypes[track->streamType()].mute) {
+                if (track->isPlaybackRestricted() ||
+                        mStreamTypes[track->streamType()].mute || track->isAppMuted()) {
                     volume = 0.f;
                 } else {
-                    volume = masterVolume * mStreamTypes[track->streamType()].volume;
+                    volume = masterVolume * mStreamTypes[track->streamType()].volume
+                                          * track->getAppVolume();
                 }
 
                 handleVoipVolume_l(&volume);
@@ -5818,13 +5858,15 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
             uint32_t vl, vr;       // in U8.24 integer format
             float vlf, vrf, vaf;   // in [0.0, 1.0] float format
             // read original volumes with volume control
-            float v = masterVolume * mStreamTypes[track->streamType()].volume;
+            float v = masterVolume * mStreamTypes[track->streamType()].volume
+                                   * track->getAppVolume();
             // Always fetch volumeshaper volume to ensure state is updated.
             const sp<AudioTrackServerProxy> proxy = track->audioTrackServerProxy();
             const float vh = track->getVolumeHandler()->getVolume(
                     track->audioTrackServerProxy()->framesReleased()).first;
 
-            if (mStreamTypes[track->streamType()].mute || track->isPlaybackRestricted()) {
+            if (mStreamTypes[track->streamType()].mute
+                    || track->isPlaybackRestricted() || track->isAppMuted()) {
                 v = 0;
             }
 
@@ -5875,7 +5917,7 @@ PlaybackThread::mixer_state MixerThread::prepareTracks_l(
                 vaf = v * sendLevel * (1. / MAX_GAIN_INT);
             }
 
-            track->setFinalVolume(vrf, vlf);
+            track->setFinalVolume(vlf, vrf);
 
             // Delegate volume control to effect in track effect chain if needed
             if (chain != 0 && chain->setVolume_l(&vl, &vr)) {
@@ -6575,11 +6617,13 @@ void DirectOutputThread::processVolume_l(IAfTrack* track, bool lastTrack)
 
     const bool clientVolumeMute = (left == 0.f && right == 0.f);
 
-    if (mMasterMute || mStreamTypes[track->streamType()].mute || track->isPlaybackRestricted()) {
+    if (mMasterMute || mStreamTypes[track->streamType()].mute
+            || track->isPlaybackRestricted() || track->isAppMuted()) {
         left = right = 0;
     } else {
         float typeVolume = mStreamTypes[track->streamType()].volume;
-        const float v = mMasterVolume * typeVolume * shaperVolume;
+        float appVolume = track->getAppVolume();
+        const float v = mMasterVolume * typeVolume * shaperVolume * appVolume;
 
         if (left > GAIN_FLOAT_UNITY) {
             left = GAIN_FLOAT_UNITY;
@@ -8125,7 +8169,6 @@ bool RecordThread::threadLoop()
     inputStandBy();
 
 reacquire_wakelock:
-    sp<IAfRecordTrack> activeTrack;
     {
         audio_utils::lock_guard _l(mutex());
         acquireWakeLock_l();
@@ -8141,6 +8184,8 @@ reacquire_wakelock:
 
     // loop while there is work to do
     for (int64_t loopCount = 0;; ++loopCount) {  // loopCount used for statistics tracking
+        // Note: these sp<> are released at the end of the for loop outside of the mutex() lock.
+        sp<IAfRecordTrack> activeTrack;
         Vector<sp<IAfEffectChain>> effectChains;
 
         // activeTracks accumulates a copy of a subset of mActiveTracks

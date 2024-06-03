@@ -1118,6 +1118,15 @@ status_t AudioFlinger::createTrack(const media::CreateTrackRequest& _input,
         output.portId = portId;
 
         if (lStatus == NO_ERROR) {
+            // set volume
+            String8 trackCreatorPackage = track->getPackageName();
+            if (!trackCreatorPackage.empty() &&
+                mAppVolumeConfigs.find(trackCreatorPackage) != mAppVolumeConfigs.end()) {
+                media::AppVolume config = mAppVolumeConfigs[trackCreatorPackage];
+                track->setAppMute(config.muted);
+                track->setAppVolume(config.volume);
+            }
+
             // no risk of deadlock because AudioFlinger::mutex() is held
             audio_utils::lock_guard _dl(thread->mutex());
             // Connect secondary outputs. Failure on a secondary output must not imped the primary
@@ -2001,6 +2010,58 @@ uint32_t AudioFlinger::getInputFramesLost(audio_io_handle_t ioHandle) const
         return recordThread->getInputFramesLost();
     }
     return 0;
+}
+
+
+status_t AudioFlinger::listAppVolumes(std::vector<media::AppVolume> *vols)
+{
+    std::set<media::AppVolume> volSet;
+    audio_utils::lock_guard _l(mutex());
+    for (size_t i = 0; i < mPlaybackThreads.size(); i++) {
+        mPlaybackThreads.valueAt(i)->listAppVolumes(volSet);
+    }
+
+    vols->insert(vols->begin(), volSet.begin(), volSet.end());
+
+    return NO_ERROR;
+}
+
+status_t AudioFlinger::setAppVolume(const String8& packageName, const float value)
+{
+    audio_utils::lock_guard _l(mutex());
+    for (size_t i = 0; i < mPlaybackThreads.size(); i++) {
+        mPlaybackThreads.valueAt(i)->setAppVolume(packageName, value);
+    }
+
+    if (mAppVolumeConfigs.find(packageName) == mAppVolumeConfigs.end()) {
+        media::AppVolume vol;
+        vol.packageName = packageName;
+        vol.volume = value;
+        vol.muted = false;
+        mAppVolumeConfigs[packageName] = vol;
+    } else {
+        mAppVolumeConfigs[packageName].volume = value;
+    }
+    return NO_ERROR;
+}
+
+status_t AudioFlinger::setAppMute(const String8& packageName, const bool value)
+{
+    audio_utils::lock_guard _l(mutex());
+    for (size_t i = 0; i < mPlaybackThreads.size(); i++) {
+        mPlaybackThreads.valueAt(i)->setAppMute(packageName, value);
+    }
+
+    if (mAppVolumeConfigs.find(packageName) == mAppVolumeConfigs.end()) {
+        media::AppVolume vol;
+        vol.packageName = packageName;
+        vol.volume = 1.0f;
+        vol.muted = value;
+        mAppVolumeConfigs[packageName] = vol;
+    } else {
+        mAppVolumeConfigs[packageName].muted = value;
+    }
+    return NO_ERROR;
 }
 
 status_t AudioFlinger::setVoiceVolume(float value)
@@ -3058,6 +3119,20 @@ status_t AudioFlinger::closeOutput_nonvirtual(audio_io_handle_t output)
 
 
             mPlaybackThreads.removeItem(output);
+            // Save AUDIO_SESSION_OUTPUT_MIX effect to chain orphans
+            // Output Mix Effect session is used to manage Music Effect by AudioPolicy Manager.
+            // It exists across all playback threads.
+            if (playbackThread->type() == IAfThreadBase::MIXER) {
+                const uint32_t sessionType =
+                        playbackThread->hasAudioSession(AUDIO_SESSION_OUTPUT_MIX);
+                if ((sessionType & IAfThreadBase::EFFECT_SESSION) != 0) {
+                    audio_utils::lock_guard _sl(playbackThread->mutex());
+                    auto mixChain = playbackThread->getEffectChain_l(AUDIO_SESSION_OUTPUT_MIX);
+                    ALOGW("%s() output %d moving mix session to orphans", __func__, output);
+                    playbackThread->removeEffectChain_l(mixChain);
+                    putOrphanEffectChain_l(mixChain);
+                }
+            }
             // save all effects to the default thread
             if (mPlaybackThreads.size()) {
                 IAfPlaybackThread* const dstThread =
@@ -4075,13 +4150,7 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
     }
 
     // check audio settings permission for global effects
-    if (sessionId == AUDIO_SESSION_OUTPUT_MIX) {
-        if (!settingsAllowed()) {
-            ALOGE("%s: no permission for AUDIO_SESSION_OUTPUT_MIX", __func__);
-            lStatus = PERMISSION_DENIED;
-            goto Exit;
-        }
-    } else if (sessionId == AUDIO_SESSION_OUTPUT_STAGE) {
+    if (sessionId == AUDIO_SESSION_OUTPUT_STAGE) {
         if (io == AUDIO_IO_HANDLE_NONE) {
             ALOGE("%s: APM must specify output when using AUDIO_SESSION_OUTPUT_STAGE", __func__);
             lStatus = BAD_VALUE;
@@ -4118,7 +4187,8 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
     } else {
         // general sessionId.
 
-        if (audio_unique_id_get_use(sessionId) != AUDIO_UNIQUE_ID_USE_SESSION) {
+        if (audio_unique_id_get_use(sessionId) != AUDIO_UNIQUE_ID_USE_SESSION 
+            && sessionId != AUDIO_SESSION_OUTPUT_MIX) {
             ALOGE("%s: invalid sessionId %d", __func__, sessionId);
             lStatus = BAD_VALUE;
             goto Exit;
@@ -4224,7 +4294,8 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
             // before creating the AudioEffect or the io handle must be specified.
             //
             // Detect if the effect is created after an AudioRecord is destroyed.
-            if (getOrphanEffectChain_l(sessionId).get() != nullptr) {
+            if ((sessionId != AUDIO_SESSION_OUTPUT_MIX) &&
+                    getOrphanEffectChain_l(sessionId).get() != nullptr) {
                 ALOGE("%s: effect %s with no specified io handle is denied because the AudioRecord"
                       " for session %d no longer exists",
                       __func__, descOut.name, sessionId);
@@ -4280,7 +4351,8 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
                     goto Exit;
                 }
             }
-        } else {
+        }
+        if (thread->type() == IAfThreadBase::RECORD || sessionId == AUDIO_SESSION_OUTPUT_MIX) {
             // Check if one effect chain was awaiting for an effect to be created on this
             // session and used it instead of creating a new one.
             sp<IAfEffectChain> chain = getOrphanEffectChain_l(sessionId);
@@ -4384,8 +4456,22 @@ NO_THREAD_SAFETY_ANALYSIS
         }
         return ret;
     }
-    IAfPlaybackThread* const srcThread = checkPlaybackThread_l(srcIo);
-    if (srcThread == nullptr) {
+    IAfPlaybackThread* srcThread = checkPlaybackThread_l(srcIo);
+    const bool foundOrphanForSessionId = (mOrphanEffectChains.indexOfKey(sessionId) >= 0);
+    if (srcThread == nullptr && !foundOrphanForSessionId && sessionId == AUDIO_SESSION_OUTPUT_MIX) {
+        ALOGW("%s() session %d not found in orphans, checking other mix", __func__, sessionId);
+        for (size_t i = 0; i < mPlaybackThreads.size(); i++) {
+            sp<IAfPlaybackThread> pt = mPlaybackThreads.valueAt(i);
+            const uint32_t sessionType = pt->hasAudioSession(sessionId);
+            if ((pt->type() == IAfThreadBase::MIXER) &&
+                    ((sessionType & IAfThreadBase::EFFECT_SESSION) != 0)) {
+                srcThread = pt.get();
+                ALOGW("%s() found srcOutput %d hosting session %d", __func__, pt->id(), sessionId);
+                break;
+            }
+        }
+    }
+    if (srcThread == nullptr && !foundOrphanForSessionId) {
         ALOGW("%s() bad srcIo %d", __func__, srcIo);
         return BAD_VALUE;
     }
@@ -4395,7 +4481,13 @@ NO_THREAD_SAFETY_ANALYSIS
         return BAD_VALUE;
     }
 
-    audio_utils::scoped_lock _ll(dstThread->mutex(), srcThread->mutex());
+    audio_utils::lock_guard _dl(dstThread->mutex());
+    if (foundOrphanForSessionId) {
+        ALOGW("moveEffects() found session %d in orphan chains", sessionId);
+        sp<IAfEffectChain> chain = getOrphanEffectChain_l(sessionId);
+        return dstThread->addEffectChain_l(chain);
+    }
+    audio_utils::lock_guard _sl(srcThread->mutex());
     return moveEffectChain_ll(sessionId, srcThread, dstThread);
 }
 
@@ -4805,7 +4897,7 @@ status_t AudioFlinger::onTransactWrapper(TransactionCode code,
         case TransactionCode::GET_AUDIO_POLICY_CONFIG:
         case TransactionCode::GET_AUDIO_MIX_PORT:
             ALOGW("%s: transaction %d received from PID %d",
-                  __func__, code, IPCThreadState::self()->getCallingPid());
+                  __func__, static_cast<int>(code), IPCThreadState::self()->getCallingPid());
             // return status only for non void methods
             switch (code) {
                 case TransactionCode::SET_RECORD_SILENCED:
@@ -4838,7 +4930,8 @@ status_t AudioFlinger::onTransactWrapper(TransactionCode code,
         case TransactionCode::SUPPORTS_BLUETOOTH_VARIABLE_LATENCY: {
             if (!isServiceUid(IPCThreadState::self()->getCallingUid())) {
                 ALOGW("%s: transaction %d received from PID %d unauthorized UID %d",
-                      __func__, code, IPCThreadState::self()->getCallingPid(),
+                      __func__, static_cast<int>(code),
+                      IPCThreadState::self()->getCallingPid(),
                       IPCThreadState::self()->getCallingUid());
                 // return status only for non-void methods
                 switch (code) {
@@ -4849,6 +4942,22 @@ status_t AudioFlinger::onTransactWrapper(TransactionCode code,
                 }
                 // Fail silently in these cases.
                 return OK;
+            }
+        } break;
+        default:
+            break;
+    }
+
+    // make sure the following transactions require MODIFY_AUDIO_ROUTING permission
+    switch (code) {
+        case TransactionCode::SET_APP_VOLUME:
+        case TransactionCode::SET_APP_MUTE: {
+            if (!modifyAudioRoutingAllowed()) {
+                ALOGW("%s: transaction %d received from PID %d UID %d does not have "
+                      "MODIFY_AUDIO_ROUTING permission",
+                      __func__, code, IPCThreadState::self()->getCallingPid(),
+                      IPCThreadState::self()->getCallingUid());
+                return INVALID_OPERATION;
             }
         } break;
         default:

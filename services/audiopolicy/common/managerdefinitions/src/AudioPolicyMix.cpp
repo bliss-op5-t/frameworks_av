@@ -52,9 +52,39 @@ bool isCriterionMatched(const AudioMixMatchCriterion& criterion,
         case RULE_MATCH_ATTRIBUTE_CAPTURE_PRESET:
             return criterion.mValue.mSource == attr.source;
         case RULE_MATCH_UID:
-            return criterion.mValue.mUid == uid;
+            {
+                if (uid == 0) {
+                    // WA until delivery of feature multi_zone_audio (b/316643994)
+                    // When the AudioPolicyManager checks the applicable device for audio attributes
+                    // it considers in prior the dynamic policy mixes installed.
+                    // If one is matching, the device returned is the registered one for this rule.
+                    // For volume request, the Uid/UserId is unknown, thus the request of matching
+                    // mixes is done with UID=0.
+                    // If there is a matching / exclusion rule on UID, it reports a false negative
+                    // (for matching rule) or false positive (for exclusion rule).
+                    // WA: There is a matching rule on the UID and UID=0 is provided by the caller
+                    //     -Exclusion criterion shall answer true in order not to validate
+                    //     -Matching shall answer false
+                    return criterion.isExcludeCriterion();
+                }
+                return criterion.mValue.mUid == uid;
+            }
         case RULE_MATCH_USERID:
             {
+                if (uid == 0) {
+                    // WA until delivery of feature multi_zone_audio (b/316643994)
+                    // When the AudioPolicyManager checks the applicable device for audio attributes
+                    // it considers in prior the dynamic policy mixes installed.
+                    // If one is matching, the device returned is the registered one for this rule.
+                    // For volume request, the Uid/UserId is unknown, thus the request of matching
+                    // mixes is done with UID=0.
+                    // If there is a matching / exclusion rule on UID, it reports a false negative
+                    // (for matching rule) or false positive (for exclusion rule).
+                    // WA: There is a matching rule on the UID and UID=0 is provided by the caller
+                    //     -Exclusion criterion shall answer true in order not to validate
+                    //     -Matching shall answer false
+                    return criterion.isExcludeCriterion();
+                }
                 userid_t userId = multiuser_get_user_id(uid);
                 return criterion.mValue.mUserId == userId;
             }
@@ -408,30 +438,6 @@ bool AudioPolicyMixCollection::mixMatch(const AudioMix* mix, size_t mixIndex,
     uid_t uid, audio_session_t session) {
 
     if (mix->mMixType == MIX_TYPE_PLAYERS) {
-        // Loopback render mixes are created from a public API and thus restricted
-        // to non sensible audio that have not opted out.
-        if (is_mix_loopback_render(mix->mRouteFlags)) {
-            if (!(attributes.usage == AUDIO_USAGE_UNKNOWN ||
-                  attributes.usage == AUDIO_USAGE_MEDIA ||
-                  attributes.usage == AUDIO_USAGE_GAME ||
-                  attributes.usage == AUDIO_USAGE_VOICE_COMMUNICATION)) {
-                return false;
-            }
-            auto hasFlag = [](auto flags, auto flag) { return (flags & flag) == flag; };
-            if (hasFlag(attributes.flags, AUDIO_FLAG_NO_SYSTEM_CAPTURE)) {
-                return false;
-            }
-
-            if (attributes.usage == AUDIO_USAGE_VOICE_COMMUNICATION) {
-                if (!mix->mVoiceCommunicationCaptureAllowed) {
-                    return false;
-                }
-            } else if (!mix->mAllowPrivilegedMediaPlaybackCapture &&
-                hasFlag(attributes.flags, AUDIO_FLAG_NO_MEDIA_PROJECTION)) {
-                return false;
-            }
-        }
-
         // Permit match only if requested format and mix format are PCM and can be format
         // adapted by the mixer, or are the same (compressed) format.
         if (!is_mix_loopback(mix->mRouteFlags) &&
